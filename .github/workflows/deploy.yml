@@ -1,0 +1,140 @@
+name: Deploy Portfolio to AWS
+
+# Trigger the workflow on push to main branch and allow manual runs
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allows manual trigger from GitHub Actions UI
+
+# Set environment variables for the workflow
+env:
+  NODE_VERSION: '20'  # Node.js version to use
+  AWS_REGION: 'us-east-1'  # AWS region where resources are located
+
+jobs:
+  deploy:
+    name: Build and Deploy to AWS
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ============================================
+      # STEP 1: Checkout the repository code
+      # ============================================
+      # This action checks out your repository under $GITHUB_WORKSPACE,
+      # so your workflow can access it.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # ============================================
+      # STEP 2: Set up Node.js environment
+      # ============================================
+      # This action sets up a Node.js environment and installs dependencies.
+      # Using npm ci (clean install) is faster and more reliable than npm install
+      # because it installs the exact versions from package-lock.json.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'  # Caches npm dependencies for faster subsequent runs
+      
+      # ============================================
+      # STEP 3: Install dependencies
+      # ============================================
+      # npm ci is the recommended way to install dependencies in CI environments.
+      # It's faster than npm install because it skips some user-focused features
+      # and installs the exact versions from package-lock.json.
+      - name: Install dependencies
+        run: npm ci
+      
+      # ============================================
+      # STEP 4: Build the production bundle
+      # ============================================
+      # This runs the build script defined in package.json.
+      # For Vite projects, this creates an optimized production build in the dist directory.
+      - name: Build production bundle
+        run: npm run build
+      
+      # ============================================
+      # STEP 5: Configure AWS credentials
+      # ============================================
+      # This action configures AWS credentials for subsequent AWS CLI commands.
+      # Credentials are loaded from GitHub Secrets for security.
+      # NEVER hardcode credentials in the workflow file.
+      # 
+      # Required GitHub Secrets (configure these in your repository settings):
+      # - AWS_ACCESS_KEY_ID: AWS access key ID
+      # - AWS_SECRET_ACCESS_KEY: AWS secret access key
+      # - AWS_SESSION_TOKEN (optional): Temporary session token if using IAM role
+      #
+      # Required environment variables:
+      # - S3_BUCKET: Name of the S3 bucket to upload files to
+      # - CLOUDFRONT_DISTRIBUTION_ID: CloudFront distribution ID for cache invalidation
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}  # Optional, for temporary credentials
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # ============================================
+      # STEP 6: Upload static assets with long-term caching
+      # ============================================
+      # Static assets (CSS, JS, images, fonts) don't change frequently and benefit
+      # from long-term caching. We set Cache-Control headers to cache these for 1 year.
+      # This improves performance by reducing the number of requests to the origin.
+      #
+      # The --exclude flag ensures we don't upload HTML/JSON files here (they're handled separately).
+      - name: Upload static assets to S3 (with long-term caching)
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET }} \
+            --exclude "*.html" \
+            --exclude "*.json" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
+      
+      # ============================================
+      # STEP 7: Upload HTML and JSON with no caching
+      # ============================================
+      # HTML and JSON files should not be cached because they may change frequently.
+      # We set Cache-Control to no-cache to ensure users always get the latest version.
+      # This is important for SPA routing and dynamic content.
+      - name: Upload HTML and JSON to S3 (no caching)
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET }} \
+            --exclude "*" \
+            --include "*.html" \
+            --include "*.json" \
+            --cache-control "public, max-age=0, no-cache, no-store, must-revalidate" \
+            --delete
+      
+      # ============================================
+      # STEP 8: Invalidate CloudFront cache
+      # ============================================
+      # After uploading files to S3, we need to invalidate the CloudFront cache
+      # to ensure users receive the updated content immediately.
+      # Without invalidation, CloudFront may serve cached content for up to the
+      # cache duration (which could be days for static assets).
+      #
+      # We invalidate all files (/*) to ensure a clean slate. This is simpler
+      # and more reliable than trying to track which files changed.
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+      
+      # ============================================
+      # STEP 9: Deployment summary
+      # ============================================
+      # This step provides a summary of the deployment for visibility in the workflow logs.
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "Deployment completed successfully!"
+          echo "=========================================="
+          echo "S3 Bucket: ${{ secrets.S3_BUCKET }}"
+          echo "CloudFront Distribution ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}"
+          echo "Region: ${{ env.AWS_REGION }}"
+          echo "=========================================="
